@@ -9,6 +9,11 @@ const blockLinks = String(process.env.BLOCK_LINKS || 'true') === 'true';
 const ignoreAdmins = String(process.env.IGNORE_ADMINS || 'true') === 'true';
 const welcomeNewMembers = String(process.env.WELCOME_NEW_MEMBERS || 'true') === 'true';
 const leaveMessageForBlockedLink = String(process.env.LEAVE_MESSAGE_FOR_BLOCKED_LINK || 'true') === 'true';
+const pairingPhoneNumber = String(process.env.PAIR_WITH_PHONE_NUMBER || '').replace(/\D/g, '');
+const pairingShowNotification = String(process.env.PAIRING_SHOW_NOTIFICATION || 'true') === 'true';
+const pairingIntervalMs = Number.parseInt(process.env.PAIRING_INTERVAL_MS || '180000', 10);
+const puppeteerExecutablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+const puppeteerHeadless = process.env.PUPPETEER_HEADLESS || 'true';
 
 const sessionPath = path.resolve('.session');
 if (!fs.existsSync(sessionPath)) {
@@ -20,8 +25,16 @@ const client = new Client({
     dataPath: sessionPath,
     clientId: 'bot-grupo'
   }),
+  ...(pairingPhoneNumber ? {
+    pairWithPhoneNumber: {
+      phoneNumber: pairingPhoneNumber,
+      showNotification: pairingShowNotification,
+      intervalMs: Number.isFinite(pairingIntervalMs) && pairingIntervalMs > 0 ? pairingIntervalMs : 180000
+    }
+  } : {}),
   puppeteer: {
-    headless: true,
+    headless: puppeteerHeadless === 'true' ? true : puppeteerHeadless,
+    ...(puppeteerExecutablePath ? { executablePath: puppeteerExecutablePath } : {}),
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   }
 });
@@ -126,6 +139,10 @@ const processedMessages = new Set();
 client.on('qr', (qr) => {
   console.log('Escaneie o QR Code abaixo com o WhatsApp:');
   qrcode.generate(qr, { small: true });
+});
+
+client.on('code', (code) => {
+  console.log(`Codigo de pareamento: ${code}`);
 });
 
 client.on('loading_screen', (percentual, mensagem) => {

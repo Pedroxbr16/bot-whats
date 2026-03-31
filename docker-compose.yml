@@ -1,0 +1,11 @@
+services:
+  bot-whatsapp:
+    build:
+      context: .
+    container_name: bot-whatsapp
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./.session:/app/.session
+      - ./.wwebjs_cache:/app/.wwebjs_cache

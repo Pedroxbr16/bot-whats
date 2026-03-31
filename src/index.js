@@ -9,6 +9,11 @@ const blockLinks = String(process.env.BLOCK_LINKS || 'true') === 'true';
 const ignoreAdmins = String(process.env.IGNORE_ADMINS || 'true') === 'true';
 const welcomeNewMembers = String(process.env.WELCOME_NEW_MEMBERS || 'true') === 'true';
 const leaveMessageForBlockedLink = String(process.env.LEAVE_MESSAGE_FOR_BLOCKED_LINK || 'true') === 'true';
+const antiSpamEnabled = String(process.env.ANTI_SPAM_ENABLED || 'true') === 'true';
+const antiSpamMaxMessages = Number.parseInt(process.env.ANTI_SPAM_MAX_MESSAGES || '5', 10);
+const antiSpamWindowMs = Number.parseInt(process.env.ANTI_SPAM_WINDOW_MS || '10000', 10);
+const antiSpamDeleteMessage = String(process.env.ANTI_SPAM_DELETE_MESSAGE || 'true') === 'true';
+const antiSpamWarnUser = String(process.env.ANTI_SPAM_WARN_USER || 'true') === 'true';
 const pairingPhoneNumber = String(process.env.PAIR_WITH_PHONE_NUMBER || '').replace(/\D/g, '');
 const pairingShowNotification = String(process.env.PAIRING_SHOW_NOTIFICATION || 'true') === 'true';
 const pairingIntervalMs = Number.parseInt(process.env.PAIRING_INTERVAL_MS || '180000', 10);
@@ -83,6 +88,34 @@ function getMessageUniqueId(message) {
 }
 
 
+function parsePositiveInteger(value, fallbackValue) {
+  const parsedValue = Number.parseInt(value, 10);
+  return Number.isFinite(parsedValue) && parsedValue > 0 ? parsedValue : fallbackValue;
+}
+
+
+function getSpamTrackerKey(chatId, senderId) {
+  if (!chatId || !senderId) return '';
+  return `${chatId}:${senderId}`;
+}
+
+
+function isSpamMessage(history, now, maxMessages, windowMs) {
+  const validWindowMs = parsePositiveInteger(windowMs, 10000);
+  const validMaxMessages = parsePositiveInteger(maxMessages, 5);
+  const recentMessages = history.filter((timestamp) => now - timestamp <= validWindowMs);
+  return {
+    recentMessages,
+    exceeded: recentMessages.length >= validMaxMessages
+  };
+}
+
+
+function buildSpamStatusMessage(isEnabled, maxMessages, windowMs) {
+  return `🤖 Anti-spam: ${isEnabled ? 'ativado' : 'desativado'} | limite: ${maxMessages} mensagem(ns) em ${Math.floor(windowMs / 1000)} segundo(s).`;
+}
+
+
 
 async function isSenderAdmin(chat, authorId) {
   if (!chat.isGroup || !authorId) return false;
@@ -127,6 +160,10 @@ function buildHelpMessage() {
     `${botPrefix}id - mostra o ID do grupo`,
     `${botPrefix}links on - ativa bloqueio de links`,
     `${botPrefix}links off - desativa bloqueio de links`,
+    `${botPrefix}spam on - ativa o anti-spam`,
+    `${botPrefix}spam off - desativa o anti-spam`,
+    `${botPrefix}spam status - mostra a configuração atual do anti-spam`,
+    `${botPrefix}spam 5 10 - permite 5 mensagens em 10 segundos`,
     '',
     'Obs.: os comandos de configuração funcionam melhor quando enviados por administradores.'
   ].join('\n');
@@ -134,7 +171,11 @@ function buildHelpMessage() {
 
 
 let blockLinksRuntime = blockLinks;
+let antiSpamEnabledRuntime = antiSpamEnabled;
+let antiSpamMaxMessagesRuntime = parsePositiveInteger(antiSpamMaxMessages, 5);
+let antiSpamWindowMsRuntime = parsePositiveInteger(antiSpamWindowMs, 10000);
 const processedMessages = new Set();
+const spamTracker = new Map();
 
 client.on('qr', (qr) => {
   console.log('Escaneie o QR Code abaixo com o WhatsApp:');
@@ -224,10 +265,60 @@ client.on('message', async (message) => {
         return;
       }
     }
+
+    if (antiSpamEnabledRuntime && texto) {
+      const shouldIgnoreSpamRule = ignoreAdmins && remetenteAdmin;
+
+      if (!shouldIgnoreSpamRule) {
+        const spamTrackerKey = getSpamTrackerKey(chat.id._serialized, remetenteId);
+        const now = Date.now();
+        const messageHistory = spamTracker.get(spamTrackerKey) || [];
+        const { recentMessages, exceeded } = isSpamMessage(
+          messageHistory,
+          now,
+          antiSpamMaxMessagesRuntime,
+          antiSpamWindowMsRuntime
+        );
+        recentMessages.push(now);
+        spamTracker.set(spamTrackerKey, recentMessages);
+
+        setTimeout(() => {
+          const currentHistory = spamTracker.get(spamTrackerKey) || [];
+          const freshHistory = currentHistory.filter((timestamp) => Date.now() - timestamp <= antiSpamWindowMsRuntime);
+
+          if (freshHistory.length > 0) {
+            spamTracker.set(spamTrackerKey, freshHistory);
+            return;
+          }
+
+          spamTracker.delete(spamTrackerKey);
+        }, antiSpamWindowMsRuntime);
+
+        if (exceeded) {
+          if (antiSpamDeleteMessage) {
+            try {
+              await message.delete(true);
+            } catch (erroAoApagar) {
+              console.error('Não foi possível apagar a mensagem por spam:', erroAoApagar.message);
+            }
+          }
+
+          if (antiSpamWarnUser) {
+            await chat.sendMessage(`🚫 @${remetenteId.split('@')[0]}, pare com o spam.`, {
+              mentions: [remetenteId]
+            });
+          }
+
+          return;
+        }
+      }
+    }
+
     if (!texto.startsWith(botPrefix)) return;
 
     const comandoCompleto = texto.slice(botPrefix.length).trim();
     const comandoNormalizado = comandoCompleto.toLowerCase();
+    const comandoPartes = comandoCompleto.split(/\s+/).filter(Boolean);
 
     if (comandoNormalizado === 'ping') {
       await message.reply('🏓 Pong! Estou online.');
@@ -241,6 +332,56 @@ client.on('message', async (message) => {
 
     if (comandoNormalizado === 'id') {
       await message.reply(`🆔 ID do grupo: ${chat.id._serialized}`);
+      return;
+    }
+
+    if (comandoNormalizado === 'spam on') {
+      if (!remetenteAdmin) {
+        await message.reply('❌ Apenas administradores podem ativar o anti-spam.');
+        return;
+      }
+
+      antiSpamEnabledRuntime = true;
+      await message.reply(`✅ ${buildSpamStatusMessage(antiSpamEnabledRuntime, antiSpamMaxMessagesRuntime, antiSpamWindowMsRuntime)}`);
+      return;
+    }
+
+    if (comandoNormalizado === 'spam off') {
+      if (!remetenteAdmin) {
+        await message.reply('❌ Apenas administradores podem desativar o anti-spam.');
+        return;
+      }
+
+      antiSpamEnabledRuntime = false;
+      await message.reply('✅ Anti-spam desativado.');
+      return;
+    }
+
+    if (comandoNormalizado === 'spam status') {
+      await message.reply(buildSpamStatusMessage(antiSpamEnabledRuntime, antiSpamMaxMessagesRuntime, antiSpamWindowMsRuntime));
+      return;
+    }
+
+    if (comandoPartes[0]?.toLowerCase() === 'spam' && comandoPartes.length === 3) {
+      if (!remetenteAdmin) {
+        await message.reply('❌ Apenas administradores podem alterar a configuração do anti-spam.');
+        return;
+      }
+
+      const novoLimite = parsePositiveInteger(comandoPartes[1], 0);
+      const novaJanelaSegundos = parsePositiveInteger(comandoPartes[2], 0);
+
+      if (!novoLimite || !novaJanelaSegundos) {
+        await message.reply(`❌ Use no formato: ${botPrefix}spam 5 10`);
+        return;
+      }
+
+      antiSpamEnabledRuntime = true;
+      antiSpamMaxMessagesRuntime = novoLimite;
+      antiSpamWindowMsRuntime = novaJanelaSegundos * 1000;
+      spamTracker.clear();
+
+      await message.reply(`✅ ${buildSpamStatusMessage(antiSpamEnabledRuntime, antiSpamMaxMessagesRuntime, antiSpamWindowMsRuntime)}`);
       return;
     }
 

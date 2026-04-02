@@ -19,6 +19,7 @@ const pairingShowNotification = String(process.env.PAIRING_SHOW_NOTIFICATION || 
 const pairingIntervalMs = Number.parseInt(process.env.PAIRING_INTERVAL_MS || '180000', 10);
 const puppeteerExecutablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
 const puppeteerHeadless = process.env.PUPPETEER_HEADLESS || 'true';
+const tenorApiKey = 'LIVDSRZULELA';
 
 const sessionPath = path.resolve('.session');
 if (!fs.existsSync(sessionPath)) {
@@ -113,6 +114,231 @@ function isSpamMessage(history, now, maxMessages, windowMs) {
 
 function buildSpamStatusMessage(isEnabled, maxMessages, windowMs) {
   return `🤖 Anti-spam: ${isEnabled ? 'ativado' : 'desativado'} | limite: ${maxMessages} mensagem(ns) em ${Math.floor(windowMs / 1000)} segundo(s).`;
+}
+
+
+function normalizeSearchText(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase();
+}
+
+
+function buildCommandQuery(commandParts) {
+  return commandParts.slice(1).join(' ').trim();
+}
+
+
+function getRandomItem(items) {
+  if (!Array.isArray(items) || items.length === 0) return null;
+  return items[Math.floor(Math.random() * items.length)] || null;
+}
+
+
+function truncateText(value, maxLength = 500) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
+}
+
+
+function upgradeAppleArtworkUrl(url) {
+  if (!url) return '';
+  return url.replace(/\/\d+x\d+bb\./, '/1000x1000bb.');
+}
+
+
+function formatDurationMs(durationMs) {
+  const totalSeconds = Math.max(0, Math.floor(Number(durationMs || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+
+function scoreTextMatch(query, candidate) {
+  const normalizedQuery = normalizeSearchText(query);
+  const normalizedCandidate = normalizeSearchText(candidate);
+
+  if (!normalizedQuery || !normalizedCandidate) return 0;
+  if (normalizedQuery === normalizedCandidate) return 100;
+  if (normalizedCandidate.startsWith(normalizedQuery)) return 80;
+  if (normalizedCandidate.includes(normalizedQuery)) return 60;
+  if (normalizedQuery.includes(normalizedCandidate)) return 40;
+
+  const queryWords = normalizedQuery.split(/\s+/).filter(Boolean);
+  const candidateWords = normalizedCandidate.split(/\s+/).filter(Boolean);
+  const matchingWords = queryWords.filter((word) => candidateWords.includes(word)).length;
+
+  return matchingWords * 10;
+}
+
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      accept: 'application/json',
+      ...(options.headers || {})
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  return response.json();
+}
+
+
+async function sendMediaFromUrl(chat, mediaUrl, options = {}) {
+  const media = await MessageMedia.fromUrl(mediaUrl, {
+    unsafeMime: true,
+    filename: options.filename
+  });
+
+  return chat.sendMessage(media, {
+    quotedMessageId: options.quotedMessageId,
+    caption: options.caption,
+    mentions: options.mentions,
+    sendMediaAsHd: options.sendMediaAsHd
+  });
+}
+
+
+function extractTenorMediaUrl(result) {
+  return result?.media_formats?.gif?.url ||
+    result?.media_formats?.mediumgif?.url ||
+    result?.media_formats?.tinygif?.url ||
+    result?.media?.[0]?.gif?.url ||
+    result?.media?.[0]?.mediumgif?.url ||
+    result?.media?.[0]?.tinygif?.url ||
+    '';
+}
+
+
+async function sendMemeFromInternet(chat, message, query) {
+  const normalizedQuery = normalizeSearchText(query);
+  const effectiveQuery = normalizedQuery || 'meme';
+
+  try {
+    const tenorUrl = new URL('https://g.tenor.com/v1/search');
+    tenorUrl.searchParams.set('q', `${effectiveQuery} meme`);
+    tenorUrl.searchParams.set('key', tenorApiKey);
+    tenorUrl.searchParams.set('limit', '20');
+    tenorUrl.searchParams.set('locale', 'pt_BR');
+    tenorUrl.searchParams.set('contentfilter', 'medium');
+
+    const tenorData = await fetchJson(tenorUrl.toString());
+    const tenorResults = Array.isArray(tenorData?.results) ? tenorData.results : [];
+    const selectedTenorResult = getRandomItem(tenorResults);
+    const tenorMediaUrl = extractTenorMediaUrl(selectedTenorResult);
+
+    if (tenorMediaUrl) {
+      await sendMediaFromUrl(chat, tenorMediaUrl, {
+        filename: `meme-${selectedTenorResult?.id || Date.now()}.gif`,
+        caption: `🤣 Meme: ${query || 'aleatorio'}`,
+        quotedMessageId: message.id._serialized
+      });
+      return;
+    }
+  } catch (erro) {
+    console.error('Erro ao buscar meme na Tenor:', erro.message);
+  }
+
+  try {
+    const data = await fetchJson('https://api.imgflip.com/get_memes');
+    const memes = Array.isArray(data?.data?.memes) ? data.data.memes : [];
+    const filteredMemes = normalizedQuery
+      ? memes.filter((meme) => normalizeSearchText(meme?.name).includes(normalizedQuery))
+      : memes;
+
+    const selectedMeme = getRandomItem(filteredMemes);
+    if (!selectedMeme?.url) {
+      await message.reply(query
+        ? `❌ Não achei meme na internet para "${query}".`
+        : '❌ Não achei meme na internet agora.');
+      return;
+    }
+
+    await sendMediaFromUrl(chat, selectedMeme.url, {
+      filename: `meme-${selectedMeme.id || Date.now()}.jpg`,
+      caption: `🤣 Meme: ${selectedMeme.name || query || 'sem titulo'}`,
+      quotedMessageId: message.id._serialized,
+      sendMediaAsHd: true
+    });
+  } catch (erro) {
+    console.error('Erro ao buscar meme na internet:', erro.message);
+    await message.reply('❌ Não consegui buscar meme na internet agora.');
+  }
+}
+
+
+async function searchItunes(term, entity, options = {}) {
+  const url = new URL('https://itunes.apple.com/search');
+  url.searchParams.set('term', term);
+  url.searchParams.set('entity', entity);
+  url.searchParams.set('limit', String(options.limit || 10));
+  url.searchParams.set('country', options.country || 'BR');
+  url.searchParams.set('lang', options.lang || 'pt_br');
+  if (options.media) {
+    url.searchParams.set('media', options.media);
+  }
+
+  const data = await fetchJson(url.toString());
+  return Array.isArray(data?.results) ? data.results : [];
+}
+
+
+async function sendMusicFromInternet(chat, message, query) {
+  if (!query) {
+    await message.reply(`❌ Use no formato: ${botPrefix}musica nome da musica`);
+    return;
+  }
+
+  try {
+    const results = await searchItunes(query, 'song');
+    const selectedTrack = results.find((track) => track?.previewUrl) || results[0];
+
+    if (!selectedTrack) {
+      await message.reply(`❌ Não achei música para "${query}".`);
+      return;
+    }
+
+    const coverUrl = upgradeAppleArtworkUrl(selectedTrack.artworkUrl100);
+    const infoMessage = [
+      `🎵 *${selectedTrack.trackName || 'Musica'}*`,
+      `👤 ${selectedTrack.artistName || 'Artista desconhecido'}`,
+      selectedTrack.collectionName ? `💿 ${selectedTrack.collectionName}` : null,
+      selectedTrack.trackTimeMillis ? `⏱️ ${formatDurationMs(selectedTrack.trackTimeMillis)}` : null,
+      selectedTrack.trackViewUrl ? `🔗 ${selectedTrack.trackViewUrl}` : null
+    ].filter(Boolean).join('\n');
+
+    if (coverUrl) {
+      await sendMediaFromUrl(chat, coverUrl, {
+        filename: `musica-${selectedTrack.trackId || Date.now()}.jpg`,
+        caption: infoMessage,
+        quotedMessageId: message.id._serialized,
+        sendMediaAsHd: true
+      });
+    } else {
+      await chat.sendMessage(infoMessage, {
+        quotedMessageId: message.id._serialized
+      });
+    }
+
+    if (selectedTrack.previewUrl) {
+      await sendMediaFromUrl(chat, selectedTrack.previewUrl, {
+        filename: `preview-${selectedTrack.trackId || Date.now()}.m4a`,
+        quotedMessageId: message.id._serialized
+      });
+    }
+  } catch (erro) {
+    console.error('Erro ao buscar musica na internet:', erro.message);
+    await message.reply('❌ Não consegui buscar música na internet agora.');
+  }
 }
 
 
@@ -433,14 +659,17 @@ function buildHelpMessage() {
     '🤖 *Comandos disponíveis*',
     '',
     `${botPrefix}ping - testa se o bot está online`,
-    `${botPrefix}menu - mostra este menu`,
+    `${botPrefix}menu / ${botPrefix}ajuda / ${botPrefix}help - mostra este menu`,
     `${botPrefix}id - mostra o ID do grupo`,
     `${botPrefix}pix - mostra a chave Pix para ajudar os adm`,
-    `${botPrefix}figurinha - cria figurinha da mídia enviada ou respondida`,
-    `${botPrefix}foto @membro - baixa a foto de perfil de quem marcar`,
-    `${botPrefix}banir @membro - remove membro por menção, resposta ou número`,
-    `${botPrefix}grupo fechar - só administradores podem falar`,
-    `${botPrefix}grupo abrir - libera mensagens para todos`,
+    `${botPrefix}meme [tema] - busca meme na internet e envia no grupo`,
+    `${botPrefix}musica nome - busca música na internet e manda prévia/link`,
+    `${botPrefix}figurinha / ${botPrefix}fig / ${botPrefix}sticker - cria figurinha da mídia enviada ou respondida`,
+    `${botPrefix}foto / ${botPrefix}perfil / ${botPrefix}pfp @membro - baixa a foto de perfil`,
+    `${botPrefix}censurar - apaga a mensagem respondida`,
+    `${botPrefix}banir / ${botPrefix}ban @membro - remove membro por menção, resposta ou número`,
+    `${botPrefix}grupo fechar / ${botPrefix}fechargrupo - só administradores podem falar`,
+    `${botPrefix}grupo abrir / ${botPrefix}abrirgrupo - libera mensagens para todos`,
     `${botPrefix}links on - ativa bloqueio de links`,
     `${botPrefix}links off - desativa bloqueio de links`,
     `${botPrefix}spam on - ativa o anti-spam`,
@@ -623,6 +852,16 @@ client.on('message', async (message) => {
       return;
     }
 
+    if (comandoPartes[0]?.toLowerCase() === 'meme') {
+      await sendMemeFromInternet(chat, message, buildCommandQuery(comandoPartes));
+      return;
+    }
+
+    if (comandoPartes[0]?.toLowerCase() === 'musica' || comandoPartes[0]?.toLowerCase() === 'música') {
+      await sendMusicFromInternet(chat, message, buildCommandQuery(comandoPartes));
+      return;
+    }
+
     if (comandoNormalizado === 'figurinha' || comandoNormalizado === 'sticker' || comandoNormalizado === 'fig') {
       const sourceMessage = await resolveStickerSourceMessage(message);
       if (!sourceMessage) {
@@ -753,6 +992,46 @@ client.on('message', async (message) => {
       } catch (erroAoAbrirGrupo) {
         console.error('Erro ao abrir grupo:', erroAoAbrirGrupo.message);
         await message.reply('❌ Não consegui abrir o grupo. Verifique se eu ainda sou admin.');
+      }
+
+      return;
+    }
+
+    if (comandoNormalizado === 'censurar' || comandoNormalizado === 'apagar' || comandoNormalizado === 'del') {
+      if (!remetenteAdmin) {
+        await message.reply('❌ Apenas administradores podem apagar mensagens.');
+        return;
+      }
+
+      const botId = client.info?.wid?._serialized || '';
+      if (!botId || !(await isSenderAdmin(chat, botId))) {
+        await message.reply('❌ Preciso ser administrador do grupo para apagar mensagens.');
+        return;
+      }
+
+      if (!message.hasQuotedMsg) {
+        await message.reply(`❌ Responda a mensagem que você quer apagar com ${botPrefix}censurar.`);
+        return;
+      }
+
+      try {
+        const quotedMessage = await message.getQuotedMessage();
+
+        if (!quotedMessage) {
+          await message.reply('❌ Não consegui localizar a mensagem selecionada.');
+          return;
+        }
+
+        await quotedMessage.delete(true);
+
+        try {
+          await message.delete(true);
+        } catch (erroAoApagarComando) {
+          console.error('Não foi possível apagar o comando de apagar:', erroAoApagarComando.message);
+        }
+      } catch (erroAoApagarMensagem) {
+        console.error('Erro ao apagar mensagem selecionada:', erroAoApagarMensagem.message);
+        await message.reply('❌ Não consegui apagar essa mensagem. Verifique se eu ainda sou admin e se a mensagem ainda existe.');
       }
 
       return;

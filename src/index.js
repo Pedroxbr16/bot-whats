@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const qrcode = require('qrcode-terminal');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 require('dotenv').config();
 
 const botPrefix = process.env.BOT_PREFIX || '!';
@@ -156,7 +156,7 @@ async function resolveParticipantIdFromChat(chat, candidateId) {
 }
 
 
-async function resolveBanTargetId(chat, message, commandParts) {
+async function resolveCommandTargetId(chat, message, commandParts) {
   const candidateIds = [];
 
   if (Array.isArray(message.mentionedIds) && message.mentionedIds.length > 0) {
@@ -275,7 +275,10 @@ function buildHelpMessage() {
     `${botPrefix}id - mostra o ID do grupo`,
     `${botPrefix}pix - mostra a chave Pix para ajudar os adm`,
     `${botPrefix}figurinha - cria figurinha da mídia enviada ou respondida`,
+    `${botPrefix}foto @membro - baixa a foto de perfil de quem marcar`,
     `${botPrefix}banir @membro - remove membro por menção, resposta ou número`,
+    `${botPrefix}grupo fechar - só administradores podem falar`,
+    `${botPrefix}grupo abrir - libera mensagens para todos`,
     `${botPrefix}links on - ativa bloqueio de links`,
     `${botPrefix}links off - desativa bloqueio de links`,
     `${botPrefix}spam on - ativa o anti-spam`,
@@ -485,6 +488,80 @@ client.on('message', async (message) => {
       } catch (erroAoCriarFigurinha) {
         console.error('Erro ao criar figurinha:', erroAoCriarFigurinha.message);
         await message.reply('❌ Não consegui criar a figurinha. Se for vídeo, confirme que o ffmpeg está disponível no ambiente.');
+      }
+
+      return;
+    }
+
+    if (
+      comandoNormalizado === 'grupo fechar' ||
+      comandoNormalizado === 'fechargrupo'
+    ) {
+      if (!remetenteAdmin) {
+        await message.reply('❌ Apenas administradores podem fechar o grupo.');
+        return;
+      }
+
+      const botId = client.info?.wid?._serialized || '';
+      if (!botId || !(await isSenderAdmin(chat, botId))) {
+        await message.reply('❌ Preciso ser administrador do grupo para fechar o envio de mensagens.');
+        return;
+      }
+
+      if (typeof chat.setMessagesAdminsOnly !== 'function') {
+        await message.reply('❌ Este grupo não permite alterar quem pode enviar mensagens por este cliente.');
+        return;
+      }
+
+      try {
+        const success = await chat.setMessagesAdminsOnly(true);
+
+        if (!success) {
+          await message.reply('❌ Não consegui fechar o grupo.');
+          return;
+        }
+
+        await message.reply('🔒 Grupo fechado. Agora só administradores podem enviar mensagens.');
+      } catch (erroAoFecharGrupo) {
+        console.error('Erro ao fechar grupo:', erroAoFecharGrupo.message);
+        await message.reply('❌ Não consegui fechar o grupo. Verifique se eu ainda sou admin.');
+      }
+
+      return;
+    }
+
+    if (
+      comandoNormalizado === 'grupo abrir' ||
+      comandoNormalizado === 'abrirgrupo'
+    ) {
+      if (!remetenteAdmin) {
+        await message.reply('❌ Apenas administradores podem abrir o grupo.');
+        return;
+      }
+
+      const botId = client.info?.wid?._serialized || '';
+      if (!botId || !(await isSenderAdmin(chat, botId))) {
+        await message.reply('❌ Preciso ser administrador do grupo para liberar o envio de mensagens.');
+        return;
+      }
+
+      if (typeof chat.setMessagesAdminsOnly !== 'function') {
+        await message.reply('❌ Este grupo não permite alterar quem pode enviar mensagens por este cliente.');
+        return;
+      }
+
+      try {
+        const success = await chat.setMessagesAdminsOnly(false);
+
+        if (!success) {
+          await message.reply('❌ Não consegui abrir o grupo.');
+          return;
+        }
+
+        await message.reply('🔓 Grupo aberto. Agora todos podem enviar mensagens.');
+      } catch (erroAoAbrirGrupo) {
+        console.error('Erro ao abrir grupo:', erroAoAbrirGrupo.message);
+        await message.reply('❌ Não consegui abrir o grupo. Verifique se eu ainda sou admin.');
       }
 
       return;

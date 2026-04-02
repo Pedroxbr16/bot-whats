@@ -116,6 +116,121 @@ function buildSpamStatusMessage(isEnabled, maxMessages, windowMs) {
 }
 
 
+function getParticipantSerializedId(participant) {
+  return participant?.id?._serialized || '';
+}
+
+
+async function resolveParticipantIdFromChat(chat, candidateId) {
+  if (!chat?.isGroup || !candidateId) return '';
+
+  const participantes = chat.participants || [];
+  const participanteEncontrado = participantes.find((participante) => {
+    return isSameWhatsAppUser(getParticipantSerializedId(participante), candidateId);
+  });
+
+  if (participanteEncontrado) {
+    return getParticipantSerializedId(participanteEncontrado);
+  }
+
+  try {
+    const participantId = await chat.client.pupPage.evaluate(async (chatId, targetId) => {
+      const chatModel = await window.WWebJS.getChat(chatId, { getAsModel: false });
+      if (!chatModel?.groupMetadata?.participants) return '';
+
+      const { lid, phone } = await window.WWebJS.enforceLidAndPnRetrieval(targetId);
+      const lidId = lid?._serialized || '';
+      const phoneId = phone?._serialized || '';
+
+      if (lidId && chatModel.groupMetadata.participants.get(lidId)) return lidId;
+      if (phoneId && chatModel.groupMetadata.participants.get(phoneId)) return phoneId;
+
+      return '';
+    }, chat.id._serialized, candidateId);
+
+    return typeof participantId === 'string' ? participantId : '';
+  } catch (erro) {
+    console.error('Erro ao localizar participante do grupo:', erro.message);
+    return '';
+  }
+}
+
+
+async function resolveBanTargetId(chat, message, commandParts) {
+  const candidateIds = [];
+
+  if (Array.isArray(message.mentionedIds) && message.mentionedIds.length > 0) {
+    candidateIds.push(...message.mentionedIds.filter(Boolean));
+  }
+
+  if (message.hasQuotedMsg) {
+    try {
+      const quotedMessage = await message.getQuotedMessage();
+      const quotedAuthorId = quotedMessage?.author || quotedMessage?.from;
+
+      if (quotedAuthorId) {
+        candidateIds.push(quotedAuthorId);
+      }
+    } catch (erro) {
+      console.error('Erro ao obter a mensagem respondida para banimento:', erro.message);
+    }
+  }
+
+  const argumento = commandParts.slice(1).join(' ').trim();
+  if (argumento) {
+    const digits = extractDigits(argumento);
+
+    if (digits) {
+      candidateIds.push(`${digits}@c.us`, digits);
+    } else {
+      candidateIds.push(argumento);
+    }
+  }
+
+  for (const candidateId of candidateIds) {
+    const participantId = await resolveParticipantIdFromChat(chat, candidateId);
+    if (participantId) return participantId;
+  }
+
+  return '';
+}
+
+
+function clearSpamTrackerForUser(chatId, participantId) {
+  if (!chatId || !participantId) return;
+
+  const keyPrefix = `${chatId}:`;
+  for (const spamKey of spamTracker.keys()) {
+    if (!spamKey.startsWith(keyPrefix)) continue;
+
+    const senderId = spamKey.slice(keyPrefix.length);
+    if (isSameWhatsAppUser(senderId, participantId)) {
+      spamTracker.delete(spamKey);
+    }
+  }
+}
+
+
+
+async function resolveStickerSourceMessage(message) {
+  if (message?.hasMedia) return message;
+  if (!message?.hasQuotedMsg) return null;
+
+  try {
+    const quotedMessage = await message.getQuotedMessage();
+    return quotedMessage?.hasMedia ? quotedMessage : null;
+  } catch (erro) {
+    console.error('Erro ao obter a mensagem respondida para figurinha:', erro.message);
+    return null;
+  }
+}
+
+
+function isStickerCompatibleMedia(media) {
+  if (!media?.mimetype) return false;
+  return media.mimetype.includes('image') || media.mimetype.includes('video');
+}
+
 
 async function isSenderAdmin(chat, authorId) {
   if (!chat.isGroup || !authorId) return false;
@@ -158,6 +273,9 @@ function buildHelpMessage() {
     `${botPrefix}ping - testa se o bot está online`,
     `${botPrefix}menu - mostra este menu`,
     `${botPrefix}id - mostra o ID do grupo`,
+    `${botPrefix}pix - mostra a chave Pix para ajudar os adm`,
+    `${botPrefix}figurinha - cria figurinha da mídia enviada ou respondida`,
+    `${botPrefix}banir @membro - remove membro por menção, resposta ou número`,
     `${botPrefix}links on - ativa bloqueio de links`,
     `${botPrefix}links off - desativa bloqueio de links`,
     `${botPrefix}spam on - ativa o anti-spam`,
@@ -332,6 +450,101 @@ client.on('message', async (message) => {
 
     if (comandoNormalizado === 'id') {
       await message.reply(`🆔 ID do grupo: ${chat.id._serialized}`);
+      return;
+    }
+
+    if (comandoNormalizado === 'pix') {
+      await message.reply('💸 Ajude os adm e pague o piraque\n\nChaves Pix:\n21971656061\n22997635869');
+      return;
+    }
+
+    if (comandoNormalizado === 'figurinha' || comandoNormalizado === 'sticker' || comandoNormalizado === 'fig') {
+      const sourceMessage = await resolveStickerSourceMessage(message);
+      if (!sourceMessage) {
+        await message.reply(`❌ Envie ${botPrefix}figurinha na legenda de uma imagem/vídeo ou responda uma mídia com esse comando.`);
+        return;
+      }
+
+      try {
+        const media = await sourceMessage.downloadMedia();
+
+        if (!media) {
+          await message.reply('❌ Não consegui baixar essa mídia para transformar em figurinha.');
+          return;
+        }
+
+        if (!isStickerCompatibleMedia(media)) {
+          await message.reply('❌ Só consigo criar figurinha a partir de imagem ou vídeo.');
+          return;
+        }
+
+        await chat.sendMessage(media, {
+          sendMediaAsSticker: true,
+          quotedMessageId: message.id._serialized
+        });
+      } catch (erroAoCriarFigurinha) {
+        console.error('Erro ao criar figurinha:', erroAoCriarFigurinha.message);
+        await message.reply('❌ Não consegui criar a figurinha. Se for vídeo, confirme que o ffmpeg está disponível no ambiente.');
+      }
+
+      return;
+    }
+
+    if (comandoPartes[0]?.toLowerCase() === 'banir' || comandoPartes[0]?.toLowerCase() === 'ban') {
+      if (!remetenteAdmin) {
+        await message.reply('❌ Apenas administradores podem banir membros.');
+        return;
+      }
+
+      const botId = client.info?.wid?._serialized || '';
+      if (!botId || !(await isSenderAdmin(chat, botId))) {
+        await message.reply('❌ Preciso ser administrador do grupo para conseguir banir alguém.');
+        return;
+      }
+
+      const alvoId = await resolveBanTargetId(chat, message, comandoPartes);
+      if (!alvoId) {
+        await message.reply(`❌ Marque, responda ou informe o número de quem deve ser removido. Ex.: ${botPrefix}banir @usuario`);
+        return;
+      }
+
+      if (isSameWhatsAppUser(alvoId, remetenteId)) {
+        await message.reply('❌ Você não pode banir a si mesmo.');
+        return;
+      }
+
+      if (botId && isSameWhatsAppUser(alvoId, botId)) {
+        await message.reply('❌ Não vou me banir do grupo.');
+        return;
+      }
+
+      if (await isSenderAdmin(chat, alvoId)) {
+        await message.reply('❌ Não vou remover outro administrador.');
+        return;
+      }
+
+      if (typeof chat.removeParticipants !== 'function') {
+        await message.reply('❌ Este grupo não permite banimento por este cliente.');
+        return;
+      }
+
+      try {
+        const resultado = await chat.removeParticipants([alvoId]);
+
+        if (resultado?.status !== 200) {
+          await message.reply('❌ Não consegui concluir o banimento.');
+          return;
+        }
+
+        clearSpamTrackerForUser(chat.id._serialized, alvoId);
+        await chat.sendMessage(`🚫 @${alvoId.split('@')[0]} foi removido(a) do grupo.`, {
+          mentions: [alvoId]
+        });
+      } catch (erroAoBanir) {
+        console.error('Erro ao banir participante:', erroAoBanir.message);
+        await message.reply('❌ Não consegui banir esse membro. Verifique se eu ainda sou admin e se a pessoa está no grupo.');
+      }
+
       return;
     }
 

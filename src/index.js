@@ -158,6 +158,13 @@ async function resolveParticipantIdFromChat(chat, candidateId) {
 
 async function resolveCommandTargetId(chat, message, commandParts) {
   const candidateIds = [];
+  const argumento = commandParts.slice(1).join(' ').trim();
+  const argumentoNormalizado = argumento.toLowerCase();
+  const remetenteId = message?.author || message?.from || '';
+
+  if (['eu', 'me', 'meu', 'minha', 'mia'].includes(argumentoNormalizado) && remetenteId) {
+    return remetenteId;
+  }
 
   if (Array.isArray(message.mentionedIds) && message.mentionedIds.length > 0) {
     candidateIds.push(...message.mentionedIds.filter(Boolean));
@@ -176,7 +183,6 @@ async function resolveCommandTargetId(chat, message, commandParts) {
     }
   }
 
-  const argumento = commandParts.slice(1).join(' ').trim();
   if (argumento) {
     const digits = extractDigits(argumento);
 
@@ -193,6 +199,162 @@ async function resolveCommandTargetId(chat, message, commandParts) {
   }
 
   return '';
+}
+
+
+function buildProfilePhotoLookupIds(targetId) {
+  const lookupIds = [];
+  if (targetId) {
+    lookupIds.push(targetId);
+  }
+
+  const digits = extractDigits(targetId);
+  if (digits) {
+    lookupIds.push(`${digits}@c.us`);
+    lookupIds.push(digits);
+  }
+
+  return [...new Set(lookupIds.filter(Boolean))];
+}
+
+
+async function getProfilePhotoCandidatesFromStore(lookupId) {
+  try {
+    const profileData = await client.pupPage.evaluate(async (contactId) => {
+      const chatWid = window.Store.WidFactory.createWid(contactId);
+      const collection = await window.Store.ProfilePicThumb.find(chatWid);
+      if (!collection) return null;
+
+      const entries = Object.entries(collection).filter(([, value]) => {
+        return typeof value === 'string' && /^https?:\/\//i.test(value);
+      });
+
+      return {
+        urls: entries.map(([key, value]) => ({ key, value }))
+      };
+    }, lookupId);
+
+    if (!profileData?.urls?.length) return [];
+
+    const priority = ['eurl', 'imgFull', 'img', 'url'];
+    return profileData.urls
+      .sort((left, right) => {
+        const leftPriority = priority.findIndex((item) => item === left.key);
+        const rightPriority = priority.findIndex((item) => item === right.key);
+        const safeLeft = leftPriority === -1 ? Number.MAX_SAFE_INTEGER : leftPriority;
+        const safeRight = rightPriority === -1 ? Number.MAX_SAFE_INTEGER : rightPriority;
+        return safeLeft - safeRight;
+      })
+      .map((item) => item.value);
+  } catch (erro) {
+    console.error(`Erro ao listar URLs da foto de perfil para ${lookupId}:`, erro.message);
+    return [];
+  }
+}
+
+
+async function getProfilePhotoThumbMediaFromStore(lookupId) {
+  try {
+    const thumbData = await client.pupPage.evaluate(async (contactId) => {
+      const chatWid = window.Store.WidFactory.createWid(contactId);
+      const base64 = await window.WWebJS.getProfilePicThumbToBase64(chatWid);
+
+      if (!base64) return null;
+
+      return {
+        data: base64,
+        mimetype: 'image/jpeg'
+      };
+    }, lookupId);
+
+    if (!thumbData?.data) return null;
+
+    return new MessageMedia(
+      thumbData.mimetype || 'image/jpeg',
+      thumbData.data,
+      `foto-perfil-${extractDigits(lookupId) || 'contato'}.jpg`
+    );
+  } catch (erro) {
+    console.error(`Erro ao buscar thumb da foto de perfil para ${lookupId}:`, erro.message);
+    return null;
+  }
+}
+
+
+async function downloadProfilePhotoMedia(photoUrl, lookupId) {
+  if (!photoUrl) return null;
+
+  const filename = `foto-perfil-${extractDigits(lookupId) || 'contato'}.jpg`;
+
+  try {
+    const browserMedia = await client.pupPage.evaluate(async (url) => {
+      const response = await fetch(url, { credentials: 'include' });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const buffer = await response.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+
+      for (const byte of bytes) {
+        binary += String.fromCharCode(byte);
+      }
+
+      return {
+        data: btoa(binary),
+        mimetype: response.headers.get('content-type') || 'image/jpeg'
+      };
+    }, photoUrl);
+
+    if (browserMedia?.data) {
+      return new MessageMedia(browserMedia.mimetype, browserMedia.data, filename);
+    }
+  } catch (erro) {
+    console.error(`Erro ao baixar foto de perfil no navegador para ${lookupId}:`, erro.message);
+  }
+
+  try {
+    return await MessageMedia.fromUrl(photoUrl, {
+      unsafeMime: true,
+      filename
+    });
+  } catch (erro) {
+    console.error(`Erro ao baixar foto de perfil no Node para ${lookupId}:`, erro.message);
+    return null;
+  }
+}
+
+
+async function resolveProfilePhotoMedia(targetId) {
+  const lookupIds = buildProfilePhotoLookupIds(targetId);
+
+  for (const lookupId of lookupIds) {
+    try {
+      const candidateUrls = await getProfilePhotoCandidatesFromStore(lookupId);
+      for (const candidateUrl of candidateUrls) {
+        const fotoPerfil = await downloadProfilePhotoMedia(candidateUrl, lookupId);
+        if (!fotoPerfil) continue;
+
+        return {
+          media: fotoPerfil,
+          resolvedId: lookupId
+        };
+      }
+
+      const thumbMedia = await getProfilePhotoThumbMediaFromStore(lookupId);
+      if (thumbMedia) {
+        return {
+          media: thumbMedia,
+          resolvedId: lookupId
+        };
+      }
+    } catch (erro) {
+      console.error(`Erro ao buscar foto de perfil para ${lookupId}:`, erro.message);
+    }
+  }
+
+  return null;
 }
 
 
@@ -493,6 +655,35 @@ client.on('message', async (message) => {
       return;
     }
 
+    if (comandoPartes[0]?.toLowerCase() === 'foto' || comandoPartes[0]?.toLowerCase() === 'perfil' || comandoPartes[0]?.toLowerCase() === 'pfp') {
+      const alvoId = await resolveCommandTargetId(chat, message, comandoPartes);
+      if (!alvoId) {
+        await message.reply(`❌ Marque, responda ou informe o número de quem você quer baixar a foto. Ex.: ${botPrefix}foto @usuario`);
+        return;
+      }
+
+      try {
+        const fotoPerfil = await resolveProfilePhotoMedia(alvoId);
+
+        if (!fotoPerfil?.media) {
+          await message.reply('❌ Não consegui acessar a foto de perfil desse contato. A privacidade dele pode estar bloqueando.');
+          return;
+        }
+
+        await chat.sendMessage(fotoPerfil.media, {
+          caption: `📸 Foto de perfil de @${alvoId.split('@')[0]}`,
+          mentions: [alvoId],
+          sendMediaAsHd: true,
+          quotedMessageId: message.id._serialized
+        });
+      } catch (erroAoBaixarFoto) {
+        console.error('Erro ao baixar foto de perfil:', erroAoBaixarFoto);
+        await message.reply('❌ Não consegui baixar essa foto de perfil agora.');
+      }
+
+      return;
+    }
+
     if (
       comandoNormalizado === 'grupo fechar' ||
       comandoNormalizado === 'fechargrupo'
@@ -579,7 +770,7 @@ client.on('message', async (message) => {
         return;
       }
 
-      const alvoId = await resolveBanTargetId(chat, message, comandoPartes);
+      const alvoId = await resolveCommandTargetId(chat, message, comandoPartes);
       if (!alvoId) {
         await message.reply(`❌ Marque, responda ou informe o número de quem deve ser removido. Ex.: ${botPrefix}banir @usuario`);
         return;

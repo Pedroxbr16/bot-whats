@@ -1,12 +1,12 @@
 const { fetchJson, sendMediaFromUrl } = require('./mediaService');
 const {
-  formatDurationMs,
-  getRandomItem,
+  formatMillisecondsAsDuration,
+  getHighResolutionArtworkUrl,
   normalizeSearchText,
-  upgradeAppleArtworkUrl
+  pickRandomItem
 } = require('../utils/common');
 
-function extractTenorMediaUrl(result) {
+function getTenorMediaUrl(result) {
   return result?.media_formats?.gif?.url ||
     result?.media_formats?.mediumgif?.url ||
     result?.media_formats?.tinygif?.url ||
@@ -16,7 +16,7 @@ function extractTenorMediaUrl(result) {
     '';
 }
 
-async function searchItunes(term, entity, options = {}) {
+async function searchITunesCatalog(term, entity, options = {}) {
   const url = new URL('https://itunes.apple.com/search');
   url.searchParams.set('term', term);
   url.searchParams.set('entity', entity);
@@ -33,11 +33,12 @@ async function searchItunes(term, entity, options = {}) {
 }
 
 function createInternetService(config) {
-  async function sendMemeFromInternet(chat, message, query) {
+  async function sendMemeSearchResult(chat, message, query) {
     const normalizedQuery = normalizeSearchText(query);
     const effectiveQuery = normalizedQuery || 'meme';
 
     try {
+      // Primeiro tenta GIFs do Tenor; se não aparecer nada útil, cai para memes estáticos.
       const tenorUrl = new URL('https://g.tenor.com/v1/search');
       tenorUrl.searchParams.set('q', `${effectiveQuery} meme`);
       tenorUrl.searchParams.set('key', config.tenorApiKey);
@@ -47,8 +48,8 @@ function createInternetService(config) {
 
       const tenorData = await fetchJson(tenorUrl.toString());
       const tenorResults = Array.isArray(tenorData?.results) ? tenorData.results : [];
-      const selectedTenorResult = getRandomItem(tenorResults);
-      const tenorMediaUrl = extractTenorMediaUrl(selectedTenorResult);
+      const selectedTenorResult = pickRandomItem(tenorResults);
+      const tenorMediaUrl = getTenorMediaUrl(selectedTenorResult);
 
       if (tenorMediaUrl) {
         await sendMediaFromUrl(chat, tenorMediaUrl, {
@@ -69,7 +70,7 @@ function createInternetService(config) {
         ? memes.filter((meme) => normalizeSearchText(meme?.name).includes(normalizedQuery))
         : memes;
 
-      const selectedMeme = getRandomItem(filteredMemes);
+      const selectedMeme = pickRandomItem(filteredMemes);
       if (!selectedMeme?.url) {
         await message.reply(query
           ? `❌ Não achei meme na internet para "${query}".`
@@ -89,14 +90,14 @@ function createInternetService(config) {
     }
   }
 
-  async function sendMusicFromInternet(chat, message, query) {
+  async function sendMusicSearchResult(chat, message, query) {
     if (!query) {
       await message.reply(`❌ Use no formato: ${config.botPrefix}musica nome da musica`);
       return;
     }
 
     try {
-      const results = await searchItunes(query, 'song');
+      const results = await searchITunesCatalog(query, 'song');
       const selectedTrack = results.find((track) => track?.previewUrl) || results[0];
 
       if (!selectedTrack) {
@@ -104,12 +105,12 @@ function createInternetService(config) {
         return;
       }
 
-      const coverUrl = upgradeAppleArtworkUrl(selectedTrack.artworkUrl100);
+      const coverUrl = getHighResolutionArtworkUrl(selectedTrack.artworkUrl100);
       const infoMessage = [
         `🎵 *${selectedTrack.trackName || 'Musica'}*`,
         `👤 ${selectedTrack.artistName || 'Artista desconhecido'}`,
         selectedTrack.collectionName ? `💿 ${selectedTrack.collectionName}` : null,
-        selectedTrack.trackTimeMillis ? `⏱️ ${formatDurationMs(selectedTrack.trackTimeMillis)}` : null,
+        selectedTrack.trackTimeMillis ? `⏱️ ${formatMillisecondsAsDuration(selectedTrack.trackTimeMillis)}` : null,
         selectedTrack.trackViewUrl ? `🔗 ${selectedTrack.trackViewUrl}` : null
       ].filter(Boolean).join('\n');
 
@@ -139,8 +140,8 @@ function createInternetService(config) {
   }
 
   return {
-    sendMemeFromInternet,
-    sendMusicFromInternet
+    sendMemeSearchResult,
+    sendMusicSearchResult
   };
 }
 

@@ -1,4 +1,4 @@
-function containsLink(text) {
+function textContainsLink(text) {
   if (!text) return false;
 
   const linkRegex = /((https?:\/\/)|(www\.)|([a-zA-Z0-9-]+\.(com|com\.br|net|org|io|gg|dev|app|info|co|me|ly|gl|tv|xyz|online|store|site|blog|edu|gov)(\/[^\s]*)?))/gi;
@@ -32,7 +32,7 @@ function isSameWhatsAppUser(leftId, rightId) {
   return Boolean(leftDigits && rightDigits && leftDigits === rightDigits);
 }
 
-function getMessageUniqueId(message) {
+function getSerializedMessageId(message) {
   return message?.id?._serialized || message?.id?.id || null;
 }
 
@@ -49,21 +49,21 @@ function normalizeSearchText(value) {
     .toLowerCase();
 }
 
-function buildCommandQuery(commandParts) {
+function extractCommandArguments(commandParts) {
   return commandParts.slice(1).join(' ').trim();
 }
 
-function getRandomItem(items) {
+function pickRandomItem(items) {
   if (!Array.isArray(items) || items.length === 0) return null;
   return items[Math.floor(Math.random() * items.length)] || null;
 }
 
-function upgradeAppleArtworkUrl(url) {
+function getHighResolutionArtworkUrl(url) {
   if (!url) return '';
   return url.replace(/\/\d+x\d+bb\./, '/1000x1000bb.');
 }
 
-function formatDurationMs(durationMs) {
+function formatMillisecondsAsDuration(durationMs) {
   const totalSeconds = Math.max(0, Math.floor(Number(durationMs || 0) / 1000));
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
@@ -71,15 +71,15 @@ function formatDurationMs(durationMs) {
 }
 
 module.exports = {
-  buildCommandQuery,
-  containsLink,
+  extractCommandArguments,
+  textContainsLink,
   extractDigits,
-  formatDurationMs,
-  getMessageUniqueId,
-  getRandomItem,
+  formatMillisecondsAsDuration,
+  getSerializedMessageId,
+  pickRandomItem,
   isSameWhatsAppUser,
   normalizeJid,
   normalizeSearchText,
   parsePositiveInteger,
-  upgradeAppleArtworkUrl
+  getHighResolutionArtworkUrl
 };

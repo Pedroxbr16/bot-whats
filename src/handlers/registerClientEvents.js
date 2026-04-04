@@ -1,5 +1,5 @@
 const qrcode = require('qrcode-terminal');
-const { createMessageHandler } = require('./createMessageHandler');
+const { createGroupMessageHandler } = require('./createMessageHandler');
 
 function registerClientEvents({ client, config, runtimeState, groupService, internetService }) {
   client.on('qr', (qr) => {
@@ -51,7 +51,7 @@ function registerClientEvents({ client, config, runtimeState, groupService, inte
     }
   });
 
-  client.on('message', createMessageHandler({
+  client.on('message', createGroupMessageHandler({
     client,
     config,
     runtimeState,

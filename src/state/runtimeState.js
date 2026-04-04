@@ -1,6 +1,6 @@
 const { isSameWhatsAppUser, parsePositiveInteger } = require('../utils/common');
 
-function createRuntimeState(config) {
+function createBotRuntimeState(config) {
   return {
     blockLinksEnabled: config.blockLinks,
     antiSpamEnabled: config.antiSpamEnabled,
@@ -11,12 +11,12 @@ function createRuntimeState(config) {
   };
 }
 
-function getSpamTrackerKey(chatId, senderId) {
+function buildSpamTrackerKey(chatId, senderId) {
   if (!chatId || !senderId) return '';
   return `${chatId}:${senderId}`;
 }
 
-function isSpamMessage(history, now, maxMessages, windowMs) {
+function evaluateSpamBurst(history, now, maxMessages, windowMs) {
   const validWindowMs = parsePositiveInteger(windowMs, 10000);
   const validMaxMessages = parsePositiveInteger(maxMessages, 5);
   const recentMessages = history.filter((timestamp) => now - timestamp <= validWindowMs);
@@ -27,11 +27,11 @@ function isSpamMessage(history, now, maxMessages, windowMs) {
   };
 }
 
-function buildSpamStatusMessage(isEnabled, maxMessages, windowMs) {
+function buildAntiSpamStatusMessage(isEnabled, maxMessages, windowMs) {
   return `🤖 Anti-spam: ${isEnabled ? 'ativado' : 'desativado'} | limite: ${maxMessages} mensagem(ns) em ${Math.floor(windowMs / 1000)} segundo(s).`;
 }
 
-function clearSpamTrackerForUser(spamTracker, chatId, participantId) {
+function clearTrackedSpamForParticipant(spamTracker, chatId, participantId) {
   if (!chatId || !participantId) return;
 
   const keyPrefix = `${chatId}:`;
@@ -40,6 +40,7 @@ function clearSpamTrackerForUser(spamTracker, chatId, participantId) {
     if (!spamKey.startsWith(keyPrefix)) continue;
 
     const senderId = spamKey.slice(keyPrefix.length);
+    // O mesmo usuário pode chegar como telefone ou LID dependendo do contexto.
     if (isSameWhatsAppUser(senderId, participantId)) {
       spamTracker.delete(spamKey);
     }
@@ -47,9 +48,9 @@ function clearSpamTrackerForUser(spamTracker, chatId, participantId) {
 }
 
 module.exports = {
-  buildSpamStatusMessage,
-  clearSpamTrackerForUser,
-  createRuntimeState,
-  getSpamTrackerKey,
-  isSpamMessage
+  buildAntiSpamStatusMessage,
+  buildSpamTrackerKey,
+  clearTrackedSpamForParticipant,
+  createBotRuntimeState,
+  evaluateSpamBurst
 };

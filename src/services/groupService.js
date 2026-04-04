@@ -1,21 +1,21 @@
 const { MessageMedia } = require('whatsapp-web.js');
 const { extractDigits, isSameWhatsAppUser } = require('../utils/common');
 
-function getParticipantSerializedId(participant) {
+function getSerializedParticipantId(participant) {
   return participant?.id?._serialized || '';
 }
 
 function createGroupService(client) {
-  async function resolveParticipantIdFromChat(chat, candidateId) {
+  async function resolveParticipantIdInGroup(chat, candidateId) {
     if (!chat?.isGroup || !candidateId) return '';
 
     const participants = chat.participants || [];
     const foundParticipant = participants.find((participant) => {
-      return isSameWhatsAppUser(getParticipantSerializedId(participant), candidateId);
+      return isSameWhatsAppUser(getSerializedParticipantId(participant), candidateId);
     });
 
     if (foundParticipant) {
-      return getParticipantSerializedId(foundParticipant);
+      return getSerializedParticipantId(foundParticipant);
     }
 
     try {
@@ -40,7 +40,7 @@ function createGroupService(client) {
     }
   }
 
-  async function resolveCommandTargetId(chat, message, commandParts) {
+  async function resolveTargetParticipantId(chat, message, commandParts) {
     const candidateIds = [];
     const argument = commandParts.slice(1).join(' ').trim();
     const normalizedArgument = argument.toLowerCase();
@@ -78,14 +78,14 @@ function createGroupService(client) {
     }
 
     for (const candidateId of candidateIds) {
-      const participantId = await resolveParticipantIdFromChat(chat, candidateId);
+      const participantId = await resolveParticipantIdInGroup(chat, candidateId);
       if (participantId) return participantId;
     }
 
     return '';
   }
 
-  function buildProfilePhotoLookupIds(targetId) {
+  function buildProfilePhotoLookupCandidates(targetId) {
     const lookupIds = [];
 
     if (targetId) {
@@ -101,7 +101,7 @@ function createGroupService(client) {
     return [...new Set(lookupIds.filter(Boolean))];
   }
 
-  async function getProfilePhotoCandidatesFromStore(lookupId) {
+  async function getProfilePhotoUrlsFromStore(lookupId) {
     try {
       const profileData = await client.pupPage.evaluate(async (contactId) => {
         const chatWid = window.Store.WidFactory.createWid(contactId);
@@ -135,7 +135,7 @@ function createGroupService(client) {
     }
   }
 
-  async function getProfilePhotoThumbMediaFromStore(lookupId) {
+  async function getProfilePhotoThumbnailMedia(lookupId) {
     try {
       const thumbData = await client.pupPage.evaluate(async (contactId) => {
         const chatWid = window.Store.WidFactory.createWid(contactId);
@@ -162,12 +162,13 @@ function createGroupService(client) {
     }
   }
 
-  async function downloadProfilePhotoMedia(photoUrl, lookupId) {
+  async function downloadProfilePhotoFromUrl(photoUrl, lookupId) {
     if (!photoUrl) return null;
 
     const filename = `foto-perfil-${extractDigits(lookupId) || 'contato'}.jpg`;
 
     try {
+      // Tenta baixar no contexto do navegador para reaproveitar a sessão autenticada.
       const browserMedia = await client.pupPage.evaluate(async (url) => {
         const response = await fetch(url, { credentials: 'include' });
         if (!response.ok) {
@@ -206,14 +207,14 @@ function createGroupService(client) {
     }
   }
 
-  async function resolveProfilePhotoMedia(targetId) {
-    const lookupIds = buildProfilePhotoLookupIds(targetId);
+  async function resolveProfilePhotoForParticipant(targetId) {
+    const lookupIds = buildProfilePhotoLookupCandidates(targetId);
 
     for (const lookupId of lookupIds) {
       try {
-        const candidateUrls = await getProfilePhotoCandidatesFromStore(lookupId);
+        const candidateUrls = await getProfilePhotoUrlsFromStore(lookupId);
         for (const candidateUrl of candidateUrls) {
-          const profilePhoto = await downloadProfilePhotoMedia(candidateUrl, lookupId);
+          const profilePhoto = await downloadProfilePhotoFromUrl(candidateUrl, lookupId);
           if (!profilePhoto) continue;
 
           return {
@@ -222,7 +223,7 @@ function createGroupService(client) {
           };
         }
 
-        const thumbMedia = await getProfilePhotoThumbMediaFromStore(lookupId);
+        const thumbMedia = await getProfilePhotoThumbnailMedia(lookupId);
         if (thumbMedia) {
           return {
             media: thumbMedia,
@@ -237,7 +238,7 @@ function createGroupService(client) {
     return null;
   }
 
-  async function isSenderAdmin(chat, authorId) {
+  async function isParticipantAdmin(chat, authorId) {
     if (!chat.isGroup || !authorId) return false;
 
     try {
@@ -271,9 +272,9 @@ function createGroupService(client) {
   }
 
   return {
-    isSenderAdmin,
-    resolveCommandTargetId,
-    resolveProfilePhotoMedia
+    isParticipantAdmin,
+    resolveProfilePhotoForParticipant,
+    resolveTargetParticipantId
   };
 }
 

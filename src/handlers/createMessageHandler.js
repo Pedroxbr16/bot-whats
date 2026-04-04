@@ -1,117 +1,160 @@
 const { buildHelpMessage } = require('../messages/helpMessage');
 const { isStickerCompatibleMedia, resolveStickerSourceMessage } = require('../services/stickerService');
 const {
-  buildSpamStatusMessage,
-  clearSpamTrackerForUser,
-  getSpamTrackerKey,
-  isSpamMessage
+  buildAntiSpamStatusMessage,
+  buildSpamTrackerKey,
+  clearTrackedSpamForParticipant,
+  evaluateSpamBurst
 } = require('../state/runtimeState');
 const {
-  buildCommandQuery,
-  containsLink,
-  getMessageUniqueId,
+  extractCommandArguments,
+  getSerializedMessageId,
   isSameWhatsAppUser,
-  parsePositiveInteger
+  parsePositiveInteger,
+  textContainsLink
 } = require('../utils/common');
 
-function createMessageHandler({ client, config, runtimeState, groupService, internetService }) {
-  return async function handleMessage(message) {
+function createGroupMessageHandler({ client, config, runtimeState, groupService, internetService }) {
+  function rememberProcessedMessage(serializedMessageId) {
+    if (!serializedMessageId) return false;
+    if (runtimeState.processedMessages.has(serializedMessageId)) return true;
+
+    runtimeState.processedMessages.add(serializedMessageId);
+
+    // Remove ids antigos para o cache não crescer indefinidamente.
+    setTimeout(() => {
+      runtimeState.processedMessages.delete(serializedMessageId);
+    }, 5 * 60 * 1000);c
+
+    return false;
+  }
+
+  async function ensureSenderIsAdmin(message, senderIsAdmin, errorMessage) {
+    if (senderIsAdmin) return true;
+
+    await message.reply(errorMessage);
+    return false;
+  }
+
+  async function ensureBotIsAdmin(chat, message, errorMessage) {
+    const botId = client.info?.wid?._serialized || '';
+
+    if (!botId || !(await groupService.isParticipantAdmin(chat, botId))) {
+      await message.reply(errorMessage);
+      return null;
+    }
+
+    return botId;
+  }
+
+  async function applyBlockedLinksPolicy({ chat, message, messageText, senderId, senderIsAdmin }) {
+    if (!runtimeState.blockLinksEnabled) return false;
+    if (!textContainsLink(messageText)) return false;
+    if (config.ignoreAdmins && senderIsAdmin) return false;
+
     try {
-      const messageUniqueId = getMessageUniqueId(message);
-      if (messageUniqueId && runtimeState.processedMessages.has(messageUniqueId)) return;
+      await message.delete(true);
+    } catch (deleteError) {
+      console.error('Não foi possível apagar a mensagem com link:', deleteError.message);
+    }
 
-      if (messageUniqueId) {
-        runtimeState.processedMessages.add(messageUniqueId);
+    if (config.leaveMessageForBlockedLink) {
+      await chat.sendMessage(`🚫 @${senderId.split('@')[0]}, links não são permitidos neste grupo.`, {
+        mentions: [senderId]
+      });
+    }
 
-        setTimeout(() => {
-          runtimeState.processedMessages.delete(messageUniqueId);
-        }, 5 * 60 * 1000);
+    return true;
+  }
+
+  async function applyAntiSpamPolicy({ chat, message, messageText, senderId, senderIsAdmin }) {
+    if (!runtimeState.antiSpamEnabled) return false;
+    if (!messageText) return false;
+    if (config.ignoreAdmins && senderIsAdmin) return false;
+
+    const spamTrackerKey = buildSpamTrackerKey(chat.id._serialized, senderId);
+    const now = Date.now();
+    const trackedTimestamps = runtimeState.spamTracker.get(spamTrackerKey) || [];
+    const { recentMessages, exceeded } = evaluateSpamBurst(
+      trackedTimestamps,
+      now,
+      runtimeState.antiSpamMaxMessages,
+      runtimeState.antiSpamWindowMs
+    );
+
+    recentMessages.push(now);
+    runtimeState.spamTracker.set(spamTrackerKey, recentMessages);
+
+    setTimeout(() => {
+      const currentTimestamps = runtimeState.spamTracker.get(spamTrackerKey) || [];
+      const timestampsStillInsideWindow = currentTimestamps.filter((timestamp) => {
+        return Date.now() - timestamp <= runtimeState.antiSpamWindowMs;
+      });
+
+      if (timestampsStillInsideWindow.length > 0) {
+        runtimeState.spamTracker.set(spamTrackerKey, timestampsStillInsideWindow);
+        return;
       }
+
+      runtimeState.spamTracker.delete(spamTrackerKey);
+    }, runtimeState.antiSpamWindowMs);
+
+    if (!exceeded) return false;
+
+    if (config.antiSpamDeleteMessage) {
+      try {
+        await message.delete(true);
+      } catch (deleteError) {
+        console.error('Não foi possível apagar a mensagem por spam:', deleteError.message);
+      }
+    }
+
+    if (config.antiSpamWarnUser) {
+      await chat.sendMessage(`🚫 @${senderId.split('@')[0]}, pare com o spam.`, {
+        mentions: [senderId]
+      });
+    }
+
+    return true;
+  }
+
+  return async function handleGroupMessage(message) {
+    try {
+      const serializedMessageId = getSerializedMessageId(message);
+      if (rememberProcessedMessage(serializedMessageId)) return;
 
       if (message.fromMe) return;
 
       const chat = await message.getChat();
       if (!chat.isGroup) return;
 
-      const text = (message.body || '').trim();
+      const messageText = (message.body || '').trim();
       const senderId = message.author || message.from;
-      const senderIsAdmin = await groupService.isSenderAdmin(chat, senderId);
+      const senderIsAdmin = await groupService.isParticipantAdmin(chat, senderId);
 
-      if (runtimeState.blockLinksEnabled && containsLink(text)) {
-        if (!(config.ignoreAdmins && senderIsAdmin)) {
-          try {
-            await message.delete(true);
-          } catch (deleteError) {
-            console.error('Não foi possível apagar a mensagem com link:', deleteError.message);
-          }
+      const blockedByLinksPolicy = await applyBlockedLinksPolicy({
+        chat,
+        message,
+        messageText,
+        senderId,
+        senderIsAdmin
+      });
+      if (blockedByLinksPolicy) return;
 
-          if (config.leaveMessageForBlockedLink) {
-            await chat.sendMessage(`🚫 @${senderId.split('@')[0]}, links não são permitidos neste grupo.`, {
-              mentions: [senderId]
-            });
-          }
+      const blockedByAntiSpamPolicy = await applyAntiSpamPolicy({
+        chat,
+        message,
+        messageText,
+        senderId,
+        senderIsAdmin
+      });
+      if (blockedByAntiSpamPolicy) return;
 
-          return;
-        }
-      }
+      if (!messageText.startsWith(config.botPrefix)) return;
 
-      if (runtimeState.antiSpamEnabled && text) {
-        const shouldIgnoreSpamRule = config.ignoreAdmins && senderIsAdmin;
-
-        if (!shouldIgnoreSpamRule) {
-          const spamTrackerKey = getSpamTrackerKey(chat.id._serialized, senderId);
-          const now = Date.now();
-          const messageHistory = runtimeState.spamTracker.get(spamTrackerKey) || [];
-          const { recentMessages, exceeded } = isSpamMessage(
-            messageHistory,
-            now,
-            runtimeState.antiSpamMaxMessages,
-            runtimeState.antiSpamWindowMs
-          );
-
-          recentMessages.push(now);
-          runtimeState.spamTracker.set(spamTrackerKey, recentMessages);
-
-          const cleanupDelayMs = runtimeState.antiSpamWindowMs;
-          setTimeout(() => {
-            const currentHistory = runtimeState.spamTracker.get(spamTrackerKey) || [];
-            const freshHistory = currentHistory.filter((timestamp) => {
-              return Date.now() - timestamp <= runtimeState.antiSpamWindowMs;
-            });
-
-            if (freshHistory.length > 0) {
-              runtimeState.spamTracker.set(spamTrackerKey, freshHistory);
-              return;
-            }
-
-            runtimeState.spamTracker.delete(spamTrackerKey);
-          }, cleanupDelayMs);
-
-          if (exceeded) {
-            if (config.antiSpamDeleteMessage) {
-              try {
-                await message.delete(true);
-              } catch (deleteError) {
-                console.error('Não foi possível apagar a mensagem por spam:', deleteError.message);
-              }
-            }
-
-            if (config.antiSpamWarnUser) {
-              await chat.sendMessage(`🚫 @${senderId.split('@')[0]}, pare com o spam.`, {
-                mentions: [senderId]
-              });
-            }
-
-            return;
-          }
-        }
-      }
-
-      if (!text.startsWith(config.botPrefix)) return;
-
-      const fullCommand = text.slice(config.botPrefix.length).trim();
-      const normalizedCommand = fullCommand.toLowerCase();
-      const commandParts = fullCommand.split(/\s+/).filter(Boolean);
+      const rawCommand = messageText.slice(config.botPrefix.length).trim();
+      const normalizedCommand = rawCommand.toLowerCase();
+      const commandParts = rawCommand.split(/\s+/).filter(Boolean);
       const commandName = commandParts[0]?.toLowerCase();
 
       if (normalizedCommand === 'ping') {
@@ -135,12 +178,12 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
       }
 
       if (commandName === 'meme') {
-        await internetService.sendMemeFromInternet(chat, message, buildCommandQuery(commandParts));
+        await internetService.sendMemeSearchResult(chat, message, extractCommandArguments(commandParts));
         return;
       }
 
       if (commandName === 'musica' || commandName === 'música') {
-        await internetService.sendMusicFromInternet(chat, message, buildCommandQuery(commandParts));
+        await internetService.sendMusicSearchResult(chat, message, extractCommandArguments(commandParts));
         return;
       }
 
@@ -177,14 +220,14 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
       }
 
       if (commandName === 'foto' || commandName === 'perfil' || commandName === 'pfp') {
-        const targetId = await groupService.resolveCommandTargetId(chat, message, commandParts);
-        if (!targetId) {
+        const targetParticipantId = await groupService.resolveTargetParticipantId(chat, message, commandParts);
+        if (!targetParticipantId) {
           await message.reply(`❌ Marque, responda ou informe o número de quem você quer baixar a foto. Ex.: ${config.botPrefix}foto @usuario`);
           return;
         }
 
         try {
-          const profilePhoto = await groupService.resolveProfilePhotoMedia(targetId);
+          const profilePhoto = await groupService.resolveProfilePhotoForParticipant(targetParticipantId);
 
           if (!profilePhoto?.media) {
             await message.reply('❌ Não consegui acessar a foto de perfil desse contato. A privacidade dele pode estar bloqueando.');
@@ -192,8 +235,8 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
           }
 
           await chat.sendMessage(profilePhoto.media, {
-            caption: `📸 Foto de perfil de @${targetId.split('@')[0]}`,
-            mentions: [targetId],
+            caption: `📸 Foto de perfil de @${targetParticipantId.split('@')[0]}`,
+            mentions: [targetParticipantId],
             sendMediaAsHd: true,
             quotedMessageId: message.id._serialized
           });
@@ -206,16 +249,19 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
       }
 
       if (normalizedCommand === 'grupo fechar' || normalizedCommand === 'fechargrupo') {
-        if (!senderIsAdmin) {
-          await message.reply('❌ Apenas administradores podem fechar o grupo.');
-          return;
-        }
+        const senderCanCloseGroup = await ensureSenderIsAdmin(
+          message,
+          senderIsAdmin,
+          '❌ Apenas administradores podem fechar o grupo.'
+        );
+        if (!senderCanCloseGroup) return;
 
-        const botId = client.info?.wid?._serialized || '';
-        if (!botId || !(await groupService.isSenderAdmin(chat, botId))) {
-          await message.reply('❌ Preciso ser administrador do grupo para fechar o envio de mensagens.');
-          return;
-        }
+        const botId = await ensureBotIsAdmin(
+          chat,
+          message,
+          '❌ Preciso ser administrador do grupo para fechar o envio de mensagens.'
+        );
+        if (!botId) return;
 
         if (typeof chat.setMessagesAdminsOnly !== 'function') {
           await message.reply('❌ Este grupo não permite alterar quem pode enviar mensagens por este cliente.');
@@ -240,16 +286,19 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
       }
 
       if (normalizedCommand === 'grupo abrir' || normalizedCommand === 'abrirgrupo') {
-        if (!senderIsAdmin) {
-          await message.reply('❌ Apenas administradores podem abrir o grupo.');
-          return;
-        }
+        const senderCanOpenGroup = await ensureSenderIsAdmin(
+          message,
+          senderIsAdmin,
+          '❌ Apenas administradores podem abrir o grupo.'
+        );
+        if (!senderCanOpenGroup) return;
 
-        const botId = client.info?.wid?._serialized || '';
-        if (!botId || !(await groupService.isSenderAdmin(chat, botId))) {
-          await message.reply('❌ Preciso ser administrador do grupo para liberar o envio de mensagens.');
-          return;
-        }
+        const botId = await ensureBotIsAdmin(
+          chat,
+          message,
+          '❌ Preciso ser administrador do grupo para liberar o envio de mensagens.'
+        );
+        if (!botId) return;
 
         if (typeof chat.setMessagesAdminsOnly !== 'function') {
           await message.reply('❌ Este grupo não permite alterar quem pode enviar mensagens por este cliente.');
@@ -274,29 +323,32 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
       }
 
       if (commandName === 'daradm' || commandName === 'promover') {
-        if (!senderIsAdmin) {
-          await message.reply('❌ Apenas administradores podem dar admin.');
-          return;
-        }
+        const senderCanPromote = await ensureSenderIsAdmin(
+          message,
+          senderIsAdmin,
+          '❌ Apenas administradores podem dar admin.'
+        );
+        if (!senderCanPromote) return;
 
-        const botId = client.info?.wid?._serialized || '';
-        if (!botId || !(await groupService.isSenderAdmin(chat, botId))) {
-          await message.reply('❌ Preciso ser administrador do grupo para promover alguém.');
-          return;
-        }
+        const botId = await ensureBotIsAdmin(
+          chat,
+          message,
+          '❌ Preciso ser administrador do grupo para promover alguém.'
+        );
+        if (!botId) return;
 
-        const targetId = await groupService.resolveCommandTargetId(chat, message, commandParts);
-        if (!targetId) {
+        const targetParticipantId = await groupService.resolveTargetParticipantId(chat, message, commandParts);
+        if (!targetParticipantId) {
           await message.reply(`❌ Marque, responda ou informe o número de quem deve virar admin. Ex.: ${config.botPrefix}daradm @usuario`);
           return;
         }
 
-        if (isSameWhatsAppUser(targetId, botId)) {
+        if (isSameWhatsAppUser(targetParticipantId, botId)) {
           await message.reply('❌ Eu já sou admin.');
           return;
         }
 
-        if (await groupService.isSenderAdmin(chat, targetId)) {
+        if (await groupService.isParticipantAdmin(chat, targetParticipantId)) {
           await message.reply('❌ Esse membro já é administrador.');
           return;
         }
@@ -307,15 +359,15 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
         }
 
         try {
-          const result = await chat.promoteParticipants([targetId]);
+          const result = await chat.promoteParticipants([targetParticipantId]);
 
           if (result?.status !== 200) {
             await message.reply('❌ Não consegui promover esse membro.');
             return;
           }
 
-          await chat.sendMessage(`👑 @${targetId.split('@')[0]} agora é administrador(a).`, {
-            mentions: [targetId]
+          await chat.sendMessage(`👑 @${targetParticipantId.split('@')[0]} agora é administrador(a).`, {
+            mentions: [targetParticipantId]
           });
         } catch (promoteError) {
           console.error('Erro ao promover participante:', promoteError.message);
@@ -326,34 +378,37 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
       }
 
       if (commandName === 'tiraradm' || commandName === 'rebaixar') {
-        if (!senderIsAdmin) {
-          await message.reply('❌ Apenas administradores podem tirar admin.');
-          return;
-        }
+        const senderCanDemote = await ensureSenderIsAdmin(
+          message,
+          senderIsAdmin,
+          '❌ Apenas administradores podem tirar admin.'
+        );
+        if (!senderCanDemote) return;
 
-        const botId = client.info?.wid?._serialized || '';
-        if (!botId || !(await groupService.isSenderAdmin(chat, botId))) {
-          await message.reply('❌ Preciso ser administrador do grupo para remover admin de alguém.');
-          return;
-        }
+        const botId = await ensureBotIsAdmin(
+          chat,
+          message,
+          '❌ Preciso ser administrador do grupo para remover admin de alguém.'
+        );
+        if (!botId) return;
 
-        const targetId = await groupService.resolveCommandTargetId(chat, message, commandParts);
-        if (!targetId) {
+        const targetParticipantId = await groupService.resolveTargetParticipantId(chat, message, commandParts);
+        if (!targetParticipantId) {
           await message.reply(`❌ Marque, responda ou informe o número de quem deve perder o cargo. Ex.: ${config.botPrefix}tiraradm @usuario`);
           return;
         }
 
-        if (isSameWhatsAppUser(targetId, senderId)) {
+        if (isSameWhatsAppUser(targetParticipantId, senderId)) {
           await message.reply('❌ Você não pode remover seu próprio cargo por aqui.');
           return;
         }
 
-        if (botId && isSameWhatsAppUser(targetId, botId)) {
+        if (isSameWhatsAppUser(targetParticipantId, botId)) {
           await message.reply('❌ Não vou remover meu próprio cargo de admin.');
           return;
         }
 
-        if (!(await groupService.isSenderAdmin(chat, targetId))) {
+        if (!(await groupService.isParticipantAdmin(chat, targetParticipantId))) {
           await message.reply('❌ Esse membro não é administrador.');
           return;
         }
@@ -364,15 +419,15 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
         }
 
         try {
-          const result = await chat.demoteParticipants([targetId]);
+          const result = await chat.demoteParticipants([targetParticipantId]);
 
           if (result?.status !== 200) {
             await message.reply('❌ Não consegui remover o cargo desse admin.');
             return;
           }
 
-          await chat.sendMessage(`⬇️ @${targetId.split('@')[0]} não é mais administrador(a).`, {
-            mentions: [targetId]
+          await chat.sendMessage(`⬇️ @${targetParticipantId.split('@')[0]} não é mais administrador(a).`, {
+            mentions: [targetParticipantId]
           });
         } catch (demoteError) {
           console.error('Erro ao rebaixar participante:', demoteError.message);
@@ -383,16 +438,19 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
       }
 
       if (normalizedCommand === 'censurar' || normalizedCommand === 'apagar' || normalizedCommand === 'del') {
-        if (!senderIsAdmin) {
-          await message.reply('❌ Apenas administradores podem apagar mensagens.');
-          return;
-        }
+        const senderCanDeleteMessages = await ensureSenderIsAdmin(
+          message,
+          senderIsAdmin,
+          '❌ Apenas administradores podem apagar mensagens.'
+        );
+        if (!senderCanDeleteMessages) return;
 
-        const botId = client.info?.wid?._serialized || '';
-        if (!botId || !(await groupService.isSenderAdmin(chat, botId))) {
-          await message.reply('❌ Preciso ser administrador do grupo para apagar mensagens.');
-          return;
-        }
+        const botId = await ensureBotIsAdmin(
+          chat,
+          message,
+          '❌ Preciso ser administrador do grupo para apagar mensagens.'
+        );
+        if (!botId) return;
 
         if (!message.hasQuotedMsg) {
           await message.reply(`❌ Responda a mensagem que você quer apagar com ${config.botPrefix}censurar.`);
@@ -423,34 +481,37 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
       }
 
       if (commandName === 'banir' || commandName === 'ban') {
-        if (!senderIsAdmin) {
-          await message.reply('❌ Apenas administradores podem banir membros.');
-          return;
-        }
+        const senderCanBan = await ensureSenderIsAdmin(
+          message,
+          senderIsAdmin,
+          '❌ Apenas administradores podem banir membros.'
+        );
+        if (!senderCanBan) return;
 
-        const botId = client.info?.wid?._serialized || '';
-        if (!botId || !(await groupService.isSenderAdmin(chat, botId))) {
-          await message.reply('❌ Preciso ser administrador do grupo para conseguir banir alguém.');
-          return;
-        }
+        const botId = await ensureBotIsAdmin(
+          chat,
+          message,
+          '❌ Preciso ser administrador do grupo para conseguir banir alguém.'
+        );
+        if (!botId) return;
 
-        const targetId = await groupService.resolveCommandTargetId(chat, message, commandParts);
-        if (!targetId) {
+        const targetParticipantId = await groupService.resolveTargetParticipantId(chat, message, commandParts);
+        if (!targetParticipantId) {
           await message.reply(`❌ Marque, responda ou informe o número de quem deve ser removido. Ex.: ${config.botPrefix}banir @usuario`);
           return;
         }
 
-        if (isSameWhatsAppUser(targetId, senderId)) {
+        if (isSameWhatsAppUser(targetParticipantId, senderId)) {
           await message.reply('❌ Você não pode banir a si mesmo.');
           return;
         }
 
-        if (botId && isSameWhatsAppUser(targetId, botId)) {
+        if (isSameWhatsAppUser(targetParticipantId, botId)) {
           await message.reply('❌ Não vou me banir do grupo.');
           return;
         }
 
-        if (await groupService.isSenderAdmin(chat, targetId)) {
+        if (await groupService.isParticipantAdmin(chat, targetParticipantId)) {
           await message.reply('❌ Não vou remover outro administrador.');
           return;
         }
@@ -461,16 +522,16 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
         }
 
         try {
-          const result = await chat.removeParticipants([targetId]);
+          const result = await chat.removeParticipants([targetParticipantId]);
 
           if (result?.status !== 200) {
             await message.reply('❌ Não consegui concluir o banimento.');
             return;
           }
 
-          clearSpamTrackerForUser(runtimeState.spamTracker, chat.id._serialized, targetId);
-          await chat.sendMessage(`🚫 @${targetId.split('@')[0]} foi removido(a) do grupo.`, {
-            mentions: [targetId]
+          clearTrackedSpamForParticipant(runtimeState.spamTracker, chat.id._serialized, targetParticipantId);
+          await chat.sendMessage(`🚫 @${targetParticipantId.split('@')[0]} foi removido(a) do grupo.`, {
+            mentions: [targetParticipantId]
           });
         } catch (banError) {
           console.error('Erro ao banir participante:', banError.message);
@@ -481,21 +542,29 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
       }
 
       if (normalizedCommand === 'spam on') {
-        if (!senderIsAdmin) {
-          await message.reply('❌ Apenas administradores podem ativar o anti-spam.');
-          return;
-        }
+        const senderCanEnableAntiSpam = await ensureSenderIsAdmin(
+          message,
+          senderIsAdmin,
+          '❌ Apenas administradores podem ativar o anti-spam.'
+        );
+        if (!senderCanEnableAntiSpam) return;
 
         runtimeState.antiSpamEnabled = true;
-        await message.reply(`✅ ${buildSpamStatusMessage(runtimeState.antiSpamEnabled, runtimeState.antiSpamMaxMessages, runtimeState.antiSpamWindowMs)}`);
+        await message.reply(`✅ ${buildAntiSpamStatusMessage(
+          runtimeState.antiSpamEnabled,
+          runtimeState.antiSpamMaxMessages,
+          runtimeState.antiSpamWindowMs
+        )}`);
         return;
       }
 
       if (normalizedCommand === 'spam off') {
-        if (!senderIsAdmin) {
-          await message.reply('❌ Apenas administradores podem desativar o anti-spam.');
-          return;
-        }
+        const senderCanDisableAntiSpam = await ensureSenderIsAdmin(
+          message,
+          senderIsAdmin,
+          '❌ Apenas administradores podem desativar o anti-spam.'
+        );
+        if (!senderCanDisableAntiSpam) return;
 
         runtimeState.antiSpamEnabled = false;
         await message.reply('✅ Anti-spam desativado.');
@@ -503,7 +572,7 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
       }
 
       if (normalizedCommand === 'spam status') {
-        await message.reply(buildSpamStatusMessage(
+        await message.reply(buildAntiSpamStatusMessage(
           runtimeState.antiSpamEnabled,
           runtimeState.antiSpamMaxMessages,
           runtimeState.antiSpamWindowMs
@@ -512,10 +581,12 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
       }
 
       if (commandName === 'spam' && commandParts.length === 3) {
-        if (!senderIsAdmin) {
-          await message.reply('❌ Apenas administradores podem alterar a configuração do anti-spam.');
-          return;
-        }
+        const senderCanConfigureAntiSpam = await ensureSenderIsAdmin(
+          message,
+          senderIsAdmin,
+          '❌ Apenas administradores podem alterar a configuração do anti-spam.'
+        );
+        if (!senderCanConfigureAntiSpam) return;
 
         const newLimit = parsePositiveInteger(commandParts[1], 0);
         const newWindowSeconds = parsePositiveInteger(commandParts[2], 0);
@@ -530,15 +601,21 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
         runtimeState.antiSpamWindowMs = newWindowSeconds * 1000;
         runtimeState.spamTracker.clear();
 
-        await message.reply(`✅ ${buildSpamStatusMessage(runtimeState.antiSpamEnabled, runtimeState.antiSpamMaxMessages, runtimeState.antiSpamWindowMs)}`);
+        await message.reply(`✅ ${buildAntiSpamStatusMessage(
+          runtimeState.antiSpamEnabled,
+          runtimeState.antiSpamMaxMessages,
+          runtimeState.antiSpamWindowMs
+        )}`);
         return;
       }
 
       if (normalizedCommand === 'links on') {
-        if (!senderIsAdmin) {
-          await message.reply('❌ Apenas administradores podem ativar o bloqueio de links.');
-          return;
-        }
+        const senderCanEnableLinkBlock = await ensureSenderIsAdmin(
+          message,
+          senderIsAdmin,
+          '❌ Apenas administradores podem ativar o bloqueio de links.'
+        );
+        if (!senderCanEnableLinkBlock) return;
 
         runtimeState.blockLinksEnabled = true;
         await message.reply('✅ Bloqueio de links ativado.');
@@ -546,10 +623,12 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
       }
 
       if (normalizedCommand === 'links off') {
-        if (!senderIsAdmin) {
-          await message.reply('❌ Apenas administradores podem desativar o bloqueio de links.');
-          return;
-        }
+        const senderCanDisableLinkBlock = await ensureSenderIsAdmin(
+          message,
+          senderIsAdmin,
+          '❌ Apenas administradores podem desativar o bloqueio de links.'
+        );
+        if (!senderCanDisableLinkBlock) return;
 
         runtimeState.blockLinksEnabled = false;
         await message.reply('✅ Bloqueio de links desativado.');
@@ -561,5 +640,5 @@ function createMessageHandler({ client, config, runtimeState, groupService, inte
 }
 
 module.exports = {
-  createMessageHandler
+  createGroupMessageHandler
 };

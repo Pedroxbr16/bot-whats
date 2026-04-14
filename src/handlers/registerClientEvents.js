@@ -1,7 +1,7 @@
 const qrcode = require('qrcode-terminal');
 const { createGroupMessageHandler } = require('./createMessageHandler');
 
-function registerClientEvents({ client, config, runtimeState, groupService, internetService }) {
+function registerClientEvents({ client, config, runtimeState, groupService }) {
   client.on('qr', (qr) => {
     console.log('Escaneie o QR Code abaixo com o WhatsApp:');
     qrcode.generate(qr, { small: true });
@@ -31,32 +31,10 @@ function registerClientEvents({ client, config, runtimeState, groupService, inte
     console.log('Bot desconectado:', reason);
   });
 
-  client.on('group_join', async (notification) => {
-    if (!config.welcomeNewMembers) return;
-
-    try {
-      const chat = await notification.getChat();
-      const addedContacts = notification.recipientIds || [];
-
-      for (const contactId of addedContacts) {
-        await chat.sendMessage(
-          `👋 Seja bem-vindo(a), @${contactId.split('@')[0]}! Leia as regras do grupo e fique à vontade.`,
-          {
-            mentions: [contactId]
-          }
-        );
-      }
-    } catch (error) {
-      console.error('Erro ao dar boas-vindas:', error.message);
-    }
-  });
-
   client.on('message', createGroupMessageHandler({
-    client,
     config,
     runtimeState,
-    groupService,
-    internetService
+    groupService
   }));
 }
 

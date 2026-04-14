@@ -7,5 +7,5 @@ services:
     env_file:
       - .env
     volumes:
-      - ./.session:/app/.session
-      - ./.wwebjs_cache:/app/.wwebjs_cache
+      - ./.session:/app/.session:z
+      - ./.wwebjs_cache:/app/.wwebjs_cache:z
